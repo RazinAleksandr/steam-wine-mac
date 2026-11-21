@@ -1,0 +1,243 @@
+#!/bin/bash
+# winebox — run the Windows version of Steam and its games on Apple Silicon macOS.
+# Stack: Wine (built from source) + DXMT (Direct3D 11 -> Metal) + MSync, under Rosetta 2.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUNTIME="$ROOT/runtime"
+DL="$RUNTIME/dl"
+LIBS_HOME="$RUNTIME/wine"          # prebuilt upstream Wine: source of third-party dylibs, and a fallback
+BUILT_HOME="$RUNTIME/wine-cx"      # Wine built from source by build/build-wine.sh
+if [ -x "$BUILT_HOME/bin/wine" ] && [ "${WINEBOX_WINE:-built}" = "built" ]; then
+  WINE_HOME="$BUILT_HOME"
+else
+  WINE_HOME="$LIBS_HOME"
+fi
+LOGS="$ROOT/logs"
+
+# --- pinned versions and checksums ------------------------------------------
+LIBS_URL="https://github.com/Gcenx/macOS_Wine_builds/releases/download/11.21/wine-staging-11.21-osx64.tar.xz"
+LIBS_SHA="d7bcd5abf4df27aae397a7898aef074fea4a2e0b51e0a55aa9659517bbf9d452"
+DXMT_URL="https://github.com/3Shain/dxmt/releases/download/v0.80/dxmt-v0.80-builtin.tar.gz"
+DXMT_SHA="8f260e36b5739e68f3bad613381441385c4dc7b85b78ba8de653d5a6a264529d"
+# Wine 11.0 source tree with the macOS patches DXMT and MSync rely on (LGPL).
+WINESRC_URL="https://media.codeweavers.com/pub/crossover/source/crossover-sources-26.3.0.tar.gz"
+WINESRC_SHA="ac99c8ca4b3848f3e81784135f023df266b61c2345726ea55a50b3e030dd6872"
+BUILD_DEPS="zig mingw-w64 bison freetype gnutls sdl2 molten-vk"
+STEAM_URL="https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe"
+
+DEADLOCK_APPID=1422450
+STEAM_REL="drive_c/Program Files (x86)/Steam"
+
+# --- Wine environment ---------------------------------------------------------
+export WINEPREFIX="${WINEBOX_PREFIX:-$ROOT/prefix}"
+export WINEDEBUG="${WINEDEBUG:--all}"
+export PATH="$WINE_HOME/bin:$PATH"
+if [ "$WINE_HOME" = "$BUILT_HOME" ]; then
+  # FreeType, GnuTLS, SDL2 and MoltenVK come from the prebuilt Wine package.
+  export DYLD_FALLBACK_LIBRARY_PATH="$LIBS_HOME/lib:/usr/lib:/usr/local/lib"
+  export WINEMSYNC="${WINEMSYNC:-1}"
+  # Our build ships neither Mono nor Gecko; suppress the "install it?" dialogs.
+  export WINEDLLOVERRIDES="mscoree=d;mshtml=d${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+fi
+# MoltenVK logs a warning per frame (hundreds of MB a minute); keep errors only.
+export MVK_CONFIG_LOG_LEVEL="${MVK_CONFIG_LOG_LEVEL:-1}"
+STEAM_DIR="$WINEPREFIX/$STEAM_REL"
+
+say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
+die()  { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
+
+need_runtime() { [ -x "$WINE_HOME/bin/wine" ] || die "Wine is not installed. Run: ./winebox setup"; }
+need_steam()   { [ -f "$STEAM_DIR/steam.exe" ] || die "Steam is not installed. Run: ./winebox setup"; }
+
+fetch() { # url, file, [sha256]
+  local url="$1" out="$2" sha="${3:-}"
+  if [ ! -f "$out" ]; then
+    say "Downloading $(basename "$out")"
+    curl -fL --retry 3 --progress-bar -o "$out.part" "$url"
+    mv "$out.part" "$out"
+  fi
+  if [ -n "$sha" ]; then
+    echo "$sha  $out" | shasum -a 256 -c - >/dev/null || die "Checksum mismatch: $out"
+  fi
+}
+
+cmd_setup() {
+  [ "$(uname -m)" = "arm64" ] && ! pgrep -q oahd && \
+    die "Rosetta 2 is required: softwareupdate --install-rosetta --agree-to-license"
+  mkdir -p "$DL" "$LOGS"
+
+  # 1. Prebuilt Wine package: third-party dylibs and a fallback runtime
+  if [ ! -x "$LIBS_HOME/bin/wine" ]; then
+    fetch "$LIBS_URL" "$DL/wine.tar.xz" "$LIBS_SHA"
+    say "Unpacking libraries"
+    local tmp="$RUNTIME/.wine-unpack"
+    rm -rf "$tmp"; mkdir -p "$tmp"
+    tar -xf "$DL/wine.tar.xz" -C "$tmp"
+    mv "$tmp"/*.app/Contents/Resources/wine "$LIBS_HOME"
+    rm -rf "$tmp"
+  fi
+
+  # 2. Build Wine from source, then re-exec so the rest of setup runs on it
+  if [ ! -x "$BUILT_HOME/bin/wine" ] && [ "${WINEBOX_WINE:-built}" = "built" ]; then
+    cmd_build_wine
+    exec "$ROOT/winebox" setup
+  fi
+
+  # 3. DXMT (Direct3D 10/11 -> Metal) over Wine's builtin DLLs
+  install_dxmt "$WINE_HOME"
+
+  build_shim
+
+  # 4. Prefix (the fake C: drive and registry)
+  if [ ! -f "$WINEPREFIX/system.reg" ]; then
+    say "Creating prefix: $WINEPREFIX"
+    WINEDLLOVERRIDES="mscoree=d;mshtml=d" wine wineboot --init >"$LOGS/wineboot.log" 2>&1
+    wineserver -w
+  fi
+
+  # 5. Steam
+  if [ ! -f "$STEAM_DIR/steam.exe" ]; then
+    fetch "$STEAM_URL" "$DL/SteamSetup.exe"
+    say "Installing Steam"
+    wine "$DL/SteamSetup.exe" /S >"$LOGS/steam-setup.log" 2>&1
+    wineserver -w
+    [ -f "$STEAM_DIR/steam.exe" ] || die "Steam did not install, see $LOGS/steam-setup.log"
+  fi
+
+  say "Done. Next: ./winebox steam   (sign in and install a game)"
+}
+
+cmd_import() { # <steamapps dir of an existing Windows Steam library on this Mac> <appid>
+  need_steam
+  [ $# -eq 2 ] || die "usage: ./winebox import <path/to/steamapps> <appid>"
+  local src="$1" appid="$2" dst="$STEAM_DIR/steamapps"
+  local manifest="$src/appmanifest_$appid.acf"
+  [ -f "$manifest" ] || die "No appmanifest_$appid.acf in $src"
+  local dir
+  dir="$(sed -n 's/^[[:space:]]*"installdir"[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$manifest" | head -1)"
+  [ -n "$dir" ] && [ -d "$src/common/$dir" ] || die "Game folder not found in $src/common"
+  [ -e "$dst/common/$dir" ] && die "Already present: $dst/common/$dir"
+  mkdir -p "$dst/common"
+  say "Cloning '$dir' (APFS copy-on-write: no extra disk space, the original is untouched)"
+  cp -cR "$src/common/$dir" "$dst/common/$dir"
+  cp -c "$manifest" "$dst/"
+  say "Done. Next: ./winebox steam, then ./winebox play $appid"
+}
+
+cmd_build_wine() { # about 15 minutes and 2 GB of disk
+  command -v brew >/dev/null || die "Homebrew is required: https://brew.sh"
+  local dep missing=""
+  for dep in $BUILD_DEPS; do brew list --formula "$dep" >/dev/null 2>&1 || missing="$missing $dep"; done
+  [ -z "$missing" ] || die "Missing packages. Run: brew install$missing"
+  [ -d "$LIBS_HOME/lib" ] || die "Run ./winebox setup first (the build needs the prebuilt libraries)"
+  mkdir -p "$DL" "$LOGS"
+  if [ ! -x "$ROOT/build/sources/wine/configure" ]; then
+    fetch "$WINESRC_URL" "$DL/wine-sources.tar.gz" "$WINESRC_SHA"
+    say "Unpacking Wine sources"
+    tar -xzf "$DL/wine-sources.tar.gz" -C "$ROOT/build" --include 'sources/wine/*'
+  fi
+  say "Building Wine (log: $LOGS/build-wine.log)"
+  arch -x86_64 /bin/bash "$ROOT/build/build-wine.sh" all >"$LOGS/build-wine.log" 2>&1 \
+    || die "Build failed, see $LOGS/build-wine.log"
+  install_dxmt "$BUILT_HOME"
+  say "Built: $BUILT_HOME"
+}
+
+install_dxmt() { # wine home
+  local home="$1"
+  [ -f "$home/.dxmt-installed" ] && return 0
+  fetch "$DXMT_URL" "$DL/dxmt.tar.gz" "$DXMT_SHA"
+  say "Installing DXMT into $(basename "$home")"
+  local tmp="$RUNTIME/.dxmt-unpack" arch
+  rm -rf "$tmp"; mkdir -p "$tmp"
+  tar -xzf "$DL/dxmt.tar.gz" -C "$tmp" --strip-components 1
+  for arch in x86_64-windows i386-windows x86_64-unix; do cp "$tmp/$arch"/* "$home/lib/wine/$arch/"; done
+  rm -rf "$tmp"
+  touch "$home/.dxmt-installed"
+}
+
+build_shim() {
+  [ -f "$RUNTIME/shim/dwmapi.dll" ] && [ "$RUNTIME/shim/dwmapi.dll" -nt "$ROOT/shim/shim.c" ] && return 0
+  say "Building the dwmapi shim"
+  "$ROOT/shim/build.sh" "$WINE_HOME/lib/wine/x86_64-windows" "$RUNTIME/shim" >/dev/null
+}
+
+install_shim() { # shim replaces dwmapi.dll in system32; the real one sits next to it as dwmapi_orig.dll
+  build_shim
+  local sys="$WINEPREFIX/drive_c/windows/system32"
+  cp "$WINE_HOME/lib/wine/x86_64-windows/dwmapi.dll" "$sys/dwmapi_orig.dll"
+  cp "$RUNTIME/shim/dwmapi.dll" "$sys/dwmapi.dll"
+}
+
+launch_steam() { # extra steam.exe arguments
+  need_runtime; need_steam
+  mkdir -p "$LOGS"
+  cd "$STEAM_DIR"
+  install_shim
+  # -cef-disable-gpu: software-rendered Steam UI (its GPU path crashes on DXMT).
+  # -no-cef-sandbox + the dwmapi shim (--in-process-gpu): without them the Steam window is black.
+  # setsid: Steam gets its own session and survives the terminal. The launch goes through
+  # `winebox run` because the system perl strips DYLD_* variables.
+  # shellcheck disable=SC2086
+  WINEDLLOVERRIDES="dwmapi=n,b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}" \
+  perl -MPOSIX -e 'setsid(); exec @ARGV' "$ROOT/winebox" run steam.exe ${WINEBOX_STEAM_ARGS:--no-cef-sandbox -cef-disable-gpu} "$@" >>"$LOGS/steam.log" 2>&1 </dev/null &
+  say "Started. Log: $LOGS/steam.log"
+}
+
+cmd_steam() { launch_steam "$@"; }
+
+cmd_play() { # appid [game arguments]
+  [ $# -ge 1 ] || die "usage: ./winebox play <appid> [game arguments]"
+  launch_steam -applaunch "$@"
+}
+
+# Deadlock needs its DirectX 11 renderer: its Vulkan renderer shows a black 3D scene on MoltenVK.
+cmd_deadlock() { cmd_play "$DEADLOCK_APPID" -dx11 "$@"; }
+
+cmd_stop() { need_runtime; wineserver -k 2>/dev/null || true; say "All Wine processes of this prefix are stopped"; }
+
+cmd_run()  { need_runtime; exec wine "$@"; }
+
+cmd_status() {
+  local ok="\033[32m✓\033[0m" no="\033[31m✗\033[0m"
+  printf "%b Wine    %s\n" "$([ -x "$WINE_HOME/bin/wine" ] && echo "$ok" || echo "$no")" \
+    "$([ -x "$WINE_HOME/bin/wine" ] && "$WINE_HOME/bin/wine" --version 2>/dev/null || echo "missing")"
+  printf "%b DXMT\n"   "$([ -f "$WINE_HOME/.dxmt-installed" ] && echo "$ok" || echo "$no")"
+  printf "%b Prefix  %s\n" "$([ -f "$WINEPREFIX/system.reg" ] && echo "$ok" || echo "$no")" "$WINEPREFIX"
+  printf "%b Steam\n"  "$([ -f "$STEAM_DIR/steam.exe" ] && echo "$ok" || echo "$no")"
+}
+
+cmd_help() {
+  cat <<HELP
+winebox — Windows Steam games on Apple Silicon macOS (Wine + DXMT)
+
+  ./winebox setup               everything from scratch: libraries, Wine build (~15 min), DXMT, prefix, Steam
+  ./winebox steam [args]        start Steam
+  ./winebox play <appid> [args] start a Steam game by its appid
+  ./winebox deadlock            example: Deadlock (appid $DEADLOCK_APPID) with its DirectX 11 renderer
+  ./winebox stop                stop every Wine process of this prefix
+  ./winebox status              show what is installed
+  ./winebox run <exe> [args]    run any .exe in the prefix (winecfg, regedit, ...)
+  ./winebox import <steamapps> <appid>
+                                clone an already-downloaded game from another Windows Steam
+                                library on this Mac (APFS clone, no re-download)
+  ./winebox build-wine          only build Wine
+
+Environment: WINEBOX_PREFIX (prefix path), WINEBOX_STEAM_ARGS, WINEBOX_WINE=upstream, WINEDEBUG.
+HELP
+}
+
+case "${1:-help}" in
+  setup)           shift; cmd_setup "$@" ;;
+  import)          shift; cmd_import "$@" ;;
+  steam)           shift; cmd_steam "$@" ;;
+  play)            shift; cmd_play "$@" ;;
+  deadlock)        shift; cmd_deadlock "$@" ;;
+  build-wine)      shift; cmd_build_wine "$@" ;;
+  stop)            shift; cmd_stop "$@" ;;
+  status)          shift; cmd_status "$@" ;;
+  run)             shift; cmd_run "$@" ;;
+  help|-h|--help)  cmd_help ;;
+  *)               cmd_help; exit 1 ;;
+esac

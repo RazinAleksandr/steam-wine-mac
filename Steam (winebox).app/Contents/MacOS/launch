@@ -1,0 +1,5 @@
+#!/bin/bash
+# Launcher: runs the winebox script that sits next to this .app.
+export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+exec "$ROOT/winebox" steam

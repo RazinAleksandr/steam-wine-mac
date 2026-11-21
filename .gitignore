@@ -1,0 +1,8 @@
+runtime/
+prefix/
+logs/
+build/obj/
+build/sources/
+build/*.tar.gz
+build/*.log
+.DS_Store
