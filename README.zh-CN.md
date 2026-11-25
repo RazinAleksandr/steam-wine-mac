@@ -7,6 +7,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/RazinAleksandr/steam-wine-mac/releases/latest"><img src="https://img.shields.io/github/v/release/RazinAleksandr/steam-wine-mac?style=flat-square&label=版本&color=8C1D4F" alt="版本"></a>
   <img src="https://img.shields.io/badge/Apple%20Silicon-arm64-111?style=flat-square&logo=apple&logoColor=white" alt="Apple Silicon">
   <img src="https://img.shields.io/badge/macOS-14%2B-111?style=flat-square" alt="macOS 14+">
   <img src="https://img.shields.io/badge/Wine-11.0-8C1D4F?style=flat-square" alt="Wine 11.0">
